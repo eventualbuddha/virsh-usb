@@ -4,9 +4,10 @@ A command-line tool for managing USB device attachment to virsh (libvirt/KVM) VM
 
 ## Features
 
-- Attach and detach USB devices to/from running VMs
-- Interactive selection of VMs and USB devices
-- Search devices by name or vendor:product ID
+- Attach and detach physical USB devices to/from running VMs
+- Create and manage named virtual USB flash drives (qcow2-backed)
+- Interactive selection of VMs and devices — physical and virtual in one list
+- Search physical devices by name or vendor:product ID
 - Shows device attachment status
 - Remembers your last used VM
 - Color-coded output for better readability
@@ -15,7 +16,7 @@ A command-line tool for managing USB device attachment to virsh (libvirt/KVM) VM
 
 - Linux system with libvirt/KVM installed
 - `virsh` command-line tool
-- `lsusb` utility (usually from `usbutils` package)
+- `lsusb` utility (usually from the `usbutils` package)
 - Rust toolchain (for building from source)
 
 ## Installation
@@ -36,7 +37,7 @@ sudo cp target/release/virsh-usb /usr/local/bin/
 
 ## Usage
 
-### Basic Commands
+### Physical USB Devices
 
 ```bash
 # Attach a USB device (interactive mode)
@@ -47,61 +48,109 @@ virsh-usb detach
 
 # Check status of a USB device
 virsh-usb status
-```
 
-### With Command-Line Arguments
-
-```bash
 # Specify VM and device by vendor:product ID
 virsh-usb --vm myvm --device 0dd4:4105 attach
 
 # Specify VM and search device by name
 virsh-usb --vm myvm --device PaperHandler attach
+```
 
-# Check status with specific VM and device
-virsh-usb --vm myvm --device 0dd4:4105 status
+### Virtual USB Flash Drives
+
+Virtual drives are qcow2 disk images stored in libvirt's default storage pool (`/var/lib/libvirt/images/`). The guest OS sees them as USB mass storage devices and can format and mount them normally.
+
+```bash
+# Create a virtual drive (default size: 4G)
+virsh-usb virtual create MyDrive
+virsh-usb virtual create MyDrive --size 8G
+
+# List all virtual drives and their attachment status
+virsh-usb virtual list
+
+# Delete a virtual drive (must be detached first)
+virsh-usb virtual delete MyDrive
+
+# Attach/detach non-interactively
+virsh-usb --vm myvm --virtual-device MyDrive attach
+virsh-usb --vm myvm --virtual-device MyDrive detach
+
+# Check status
+virsh-usb --vm myvm --virtual-device MyDrive status
 ```
 
 ### Interactive Mode
 
-When you run commands without the `--vm` or `--device` flags, the tool will prompt you interactively:
+When you run commands without device flags, the tool prompts you interactively:
 
-1. **VM Selection**: Choose from a list of all your VMs (defaults to the last used VM)
-2. **Device Selection**: Choose from a list of connected USB devices
-   - For attach: shows all USB devices
-   - For detach: shows only devices currently attached to the VM
+1. **VM Selection**: Choose from a list of all your VMs (defaults to last used)
+2. **Device Selection**: Choose from a flat list of physical and virtual devices
+
+```
+[USB]  0dd4:4105 - PaperHandler (Bus 003 Device 006)
+[USB]  046d:c52b - Logitech USB Receiver (Bus 001 Device 003) [attached]
+[VIRT] MyDrive (8G)
+[VIRT] BackupDrive (16G) [attached]
++ Create new virtual drive...
+```
+
+- **Attach**: shows all devices; selecting "Create new virtual drive..." prompts for a name and size
+- **Detach**: shows only devices currently attached to the VM
 
 ## How It Works
 
 The tool uses the virsh API to:
-- Query running VMs
+- Query and select VMs
 - Parse VM XML configurations to check device attachments
-- Generate XML definitions for USB passthrough
+- Generate XML definitions for USB passthrough and virtual disk attachment
 - Attach/detach devices using `virsh attach-device` and `virsh detach-device`
+- Create and delete virtual drive images using `virsh vol-create-as` and `virsh vol-delete`
 
-Device information is retrieved using the `lsusb` command.
+Physical device information is retrieved using `lsusb`. Virtual drive metadata is stored in `~/.local/share/virsh-usb/drives.json`.
 
 ## Examples
 
-### Attach a USB Device
+### Attach a Physical USB Device
 
-```bash
+```
 $ virsh-usb attach
 🖥 Select a VM
   > my-windows-vm
-    my-linux-vm
-    test-vm
 
-🔌 Select a USB device
-  > 0dd4:4105 - PaperHandler (Bus 003 Device 006)
-    046d:c52b - Logitech USB Receiver (Bus 001 Device 003)
+🔌 Select a device
+  > [USB]  0dd4:4105 - PaperHandler (Bus 003 Device 006)
+    [VIRT] MyDrive (8G)
+    + Create new virtual drive...
 
 ✓ Successfully attached PaperHandler (0dd4:4105) to my-windows-vm
 ```
 
+### Create and Attach a Virtual Drive
+
+```
+$ virsh-usb virtual create WorkDrive --size 4G
+✓ Created virtual drive WorkDrive (4G) at /var/lib/libvirt/images/WorkDrive.qcow2
+
+$ virsh-usb --vm my-windows-vm --virtual-device WorkDrive attach
+✓ Successfully attached virtual drive WorkDrive to my-windows-vm
+```
+
+### List Virtual Drives
+
+```
+$ virsh-usb virtual list
+Virtual USB Flash Drives:
+
+  WorkDrive            4G     attached to: my-windows-vm
+  /var/lib/libvirt/images/WorkDrive.qcow2
+
+  BackupDrive          16G    not attached
+  /var/lib/libvirt/images/BackupDrive.qcow2
+```
+
 ### Check Status
 
-```bash
+```
 $ virsh-usb --vm my-windows-vm --device 0dd4:4105 status
 🖥 VM (my-windows-vm): Running
 🔌 PaperHandler (0dd4:4105): Connected (Bus 003 Device 006)
@@ -110,11 +159,11 @@ $ virsh-usb --vm my-windows-vm --device 0dd4:4105 status
 
 ## Requirements for VM
 
-Your VM must be running to attach or detach USB devices. The tool uses "live" attachment, which means devices are attached to the running VM without needing to restart it.
+Your VM must be running to attach or detach devices. The tool uses live attachment, so devices are added to the running VM without a restart.
 
 ## Permissions
 
-You may need appropriate permissions to use virsh commands. If you're not in the `libvirt` group, you might need to run the tool with `sudo` or add your user to the group:
+You may need appropriate permissions to use virsh commands. If you're not in the `libvirt` group, add your user and log in again:
 
 ```bash
 sudo usermod -aG libvirt $USER
@@ -122,8 +171,12 @@ sudo usermod -aG libvirt $USER
 
 ## Configuration
 
-The tool saves the last used VM in your system's config directory:
-- Linux: `~/.config/virsh-usb/last_vm`
+The tool stores data in two locations:
+
+- `~/.config/virsh-usb/last_vm` — last selected VM
+- `~/.local/share/virsh-usb/drives.json` — virtual drive metadata
+
+Virtual drive images are stored in libvirt's default storage pool, typically `/var/lib/libvirt/images/`.
 
 ## Troubleshooting
 
@@ -131,10 +184,16 @@ The tool saves the last used VM in your system's config directory:
 The VM must be running (not paused or stopped) to attach or detach devices.
 
 ### "USB device not found"
-Make sure the USB device is physically connected to your host system. Run `lsusb` to verify.
+Make sure the USB device is physically connected to your host. Run `lsusb` to verify.
 
-### "Permission denied"
-Ensure you have proper permissions to use virsh. Add your user to the `libvirt` group or use sudo.
+### "Permission denied" / libvirt access errors
+Ensure your user is in the `libvirt` group (see Permissions above).
+
+### Virtual drive not found in storage pool
+If you see an error about a missing volume, check what's in the default pool:
+```bash
+virsh vol-list default
+```
 
 ## License
 
