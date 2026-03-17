@@ -570,6 +570,7 @@ dependencies = [
  "console",
  "directories",
  "inquire",
+ "libc",
  "serde",
  "serde_json",
 ]

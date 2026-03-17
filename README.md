@@ -6,7 +6,9 @@ A command-line tool for managing USB device attachment to virsh (libvirt/KVM) VM
 
 - Attach and detach physical USB devices to/from running VMs
 - Create and manage named virtual USB flash drives (qcow2-backed)
-- Interactive selection of VMs and devices — physical and virtual in one list
+- Create and manage virtual USB HID keyboards with configurable VID/PID
+- Type text into VMs via virtual HID keyboard
+- Interactive selection of VMs and devices — physical, storage, and HID in one list
 - Search physical devices by name or vendor:product ID
 - Shows device attachment status
 - Remembers your last used VM
@@ -17,6 +19,7 @@ A command-line tool for managing USB device attachment to virsh (libvirt/KVM) VM
 - Linux system with libvirt/KVM installed
 - `virsh` command-line tool
 - `lsusb` utility (usually from the `usbutils` package)
+- `vhci-hcd` kernel module (for virtual HID devices)
 - Rust toolchain (for building from source)
 
 ## Installation
@@ -25,15 +28,37 @@ A command-line tool for managing USB device attachment to virsh (libvirt/KVM) VM
 
 ```bash
 cargo build --release
-```
-
-The binary will be available at `target/release/virsh-usb`.
-
-Optionally, copy it to your PATH:
-
-```bash
 sudo cp target/release/virsh-usb /usr/local/bin/
 ```
+
+### Permissions
+
+Add yourself to the `libvirt` group for virsh access:
+
+```bash
+sudo usermod -aG libvirt $USER
+```
+
+For virtual HID devices, also add yourself to `plugdev` and install the udev rules:
+
+```bash
+sudo usermod -aG plugdev $USER
+
+sudo tee /etc/udev/rules.d/99-virsh-usb.rules > /dev/null <<'EOF'
+# Allow plugdev group to attach/detach vhci_hcd devices
+SUBSYSTEM=="platform", DRIVER=="vhci_hcd", RUN+="/bin/sh -c 'chown root:plugdev /sys%p/attach /sys%p/detach && chmod 0660 /sys%p/attach /sys%p/detach'"
+# Allow kvm group (libvirt-qemu) write access to vhci_hcd USB device files
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_PATH}=="platform-vhci_hcd*", GROUP="kvm", MODE="0660"
+# Auto-unbind host kernel drivers from vhci_hcd interfaces so QEMU can claim them
+ACTION=="bind", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ENV{ID_PATH}=="platform-vhci_hcd*", RUN+="/bin/sh -c 'echo %k > /sys/bus/usb/drivers/usbhid/unbind 2>/dev/null; echo %k > /sys/bus/usb/drivers/hid-generic/unbind 2>/dev/null'"
+EOF
+
+sudo udevadm control --reload-rules
+
+echo vhci-hcd | sudo tee /etc/modules-load.d/virsh-usb.conf
+```
+
+Log out and back in for group changes to take effect.
 
 ## Usage
 
@@ -62,21 +87,49 @@ Virtual drives are qcow2 disk images stored in libvirt's default storage pool (`
 
 ```bash
 # Create a virtual drive (default size: 4G)
-virsh-usb virtual create MyDrive
-virsh-usb virtual create MyDrive --size 8G
+virsh-usb storage create MyDrive
+virsh-usb storage create MyDrive --size 8G
 
 # List all virtual drives and their attachment status
-virsh-usb virtual list
+virsh-usb storage list
 
 # Delete a virtual drive (must be detached first)
-virsh-usb virtual delete MyDrive
+virsh-usb storage delete MyDrive
 
 # Attach/detach non-interactively
-virsh-usb --vm myvm --virtual-device MyDrive attach
-virsh-usb --vm myvm --virtual-device MyDrive detach
+virsh-usb --vm myvm --device MyDrive attach
+virsh-usb --vm myvm --device MyDrive detach
+```
 
-# Check status
-virsh-usb --vm myvm --virtual-device MyDrive status
+### Virtual USB HID Keyboards
+
+Virtual HID devices appear to the guest as a USB keyboard with your chosen VID/PID. Useful for presenting as a specific scanner, card reader, or input device.
+
+```bash
+# Create a virtual HID device
+virsh-usb hid create MyScanner --vid 0x0c2e --pid 0x0b61
+
+# List all virtual HID devices
+virsh-usb hid list
+
+# Delete a virtual HID device
+virsh-usb hid delete MyScanner
+
+# Type text into the VM (appends Enter by default)
+virsh-usb hid type "Hello, world!"
+
+# Type text without Enter
+virsh-usb hid type "scan data" --no-enter
+
+# Specify VM and device explicitly
+virsh-usb hid type "Hello" --vm myvm --device MyScanner
+```
+
+Attach and detach HID devices using the standard commands:
+
+```bash
+virsh-usb --vm myvm --device MyScanner attach
+virsh-usb --vm myvm --device MyScanner detach
 ```
 
 ### Interactive Mode
@@ -84,97 +137,52 @@ virsh-usb --vm myvm --virtual-device MyDrive status
 When you run commands without device flags, the tool prompts you interactively:
 
 1. **VM Selection**: Choose from a list of all your VMs (defaults to last used)
-2. **Device Selection**: Choose from a flat list of physical and virtual devices
+2. **Device Selection**: Choose from a flat list of all device types
 
 ```
-[USB]  0dd4:4105 - PaperHandler (Bus 003 Device 006)
-[USB]  046d:c52b - Logitech USB Receiver (Bus 001 Device 003) [attached]
-[VIRT] MyDrive (8G)
-[VIRT] BackupDrive (16G) [attached]
-+ Create new virtual drive...
+[USB]     0dd4:4105 - PaperHandler (Bus 003 Device 006)
+[USB]     046d:c52b - Logitech USB Receiver (Bus 001 Device 003) [attached]
+[STORAGE] MyDrive (8G)
+[STORAGE] BackupDrive (16G) [attached]
+[HID]     MyScanner (0c2e:0b61)
+[HID]     MyReader (08fc:0012) [attached]
++ Create new storage drive...
++ Create new HID device...
 ```
 
-- **Attach**: shows all devices; selecting "Create new virtual drive..." prompts for a name and size
+- **Attach**: shows all devices; options to create new storage or HID devices inline
 - **Detach**: shows only devices currently attached to the VM
 
 ## How It Works
 
-The tool uses the virsh API to:
-- Query and select VMs
-- Parse VM XML configurations to check device attachments
-- Generate XML definitions for USB passthrough and virtual disk attachment
-- Attach/detach devices using `virsh attach-device` and `virsh detach-device`
-- Create and delete virtual drive images using `virsh vol-create-as` and `virsh vol-delete`
+### Physical USB Passthrough
 
-Physical device information is retrieved using `lsusb`. Virtual drive metadata is stored in `~/.local/share/virsh-usb/drives.json`.
+Uses `virsh attach-device` / `virsh detach-device` with a USB hostdev XML definition. Device information is retrieved with `lsusb`.
 
-## Examples
+### Virtual Storage Drives
 
-### Attach a Physical USB Device
+Creates qcow2 disk images via `virsh vol-create-as` and attaches them as USB mass storage (`bus='usb'`) using `virsh attach-device`.
 
-```
-$ virsh-usb attach
-🖥 Select a VM
-  > my-windows-vm
+### Virtual HID Devices
 
-🔌 Select a device
-  > [USB]  0dd4:4105 - PaperHandler (Bus 003 Device 006)
-    [VIRT] MyDrive (8G)
-    + Create new virtual drive...
+Uses the USB/IP protocol and the `vhci-hcd` kernel module:
 
-✓ Successfully attached PaperHandler (0dd4:4105) to my-windows-vm
-```
+1. A daemon process implements a USB/IP server that emulates a HID keyboard with the configured VID/PID
+2. The main process performs the USB/IP IMPORT handshake, then passes the socket to `vhci_hcd` via sysfs
+3. The device appears in `lsusb` with the correct VID/PID
+4. `virsh attach-device` passes it through to the guest VM
+5. `virsh-usb hid type` sends text to the daemon via a Unix socket, which injects HID key reports
 
-### Create and Attach a Virtual Drive
-
-```
-$ virsh-usb virtual create WorkDrive --size 4G
-✓ Created virtual drive WorkDrive (4G) at /var/lib/libvirt/images/WorkDrive.qcow2
-
-$ virsh-usb --vm my-windows-vm --virtual-device WorkDrive attach
-✓ Successfully attached virtual drive WorkDrive to my-windows-vm
-```
-
-### List Virtual Drives
-
-```
-$ virsh-usb virtual list
-Virtual USB Flash Drives:
-
-  WorkDrive            4G     attached to: my-windows-vm
-  /var/lib/libvirt/images/WorkDrive.qcow2
-
-  BackupDrive          16G    not attached
-  /var/lib/libvirt/images/BackupDrive.qcow2
-```
-
-### Check Status
-
-```
-$ virsh-usb --vm my-windows-vm --device 0dd4:4105 status
-🖥 VM (my-windows-vm): Running
-🔌 PaperHandler (0dd4:4105): Connected (Bus 003 Device 006)
-🔗 Attachment Status: Attached to VM
-```
-
-## Requirements for VM
-
-Your VM must be running to attach or detach devices. The tool uses live attachment, so devices are added to the running VM without a restart.
-
-## Permissions
-
-You may need appropriate permissions to use virsh commands. If you're not in the `libvirt` group, add your user and log in again:
-
-```bash
-sudo usermod -aG libvirt $USER
-```
+Daemon state files are stored in `~/.local/share/virsh-usb/`.
 
 ## Configuration
 
-The tool stores data in two locations:
+The tool stores data in:
 
 - `~/.config/virsh-usb/last_vm` — last selected VM
 - `~/.local/share/virsh-usb/drives.json` — virtual drive metadata
+- `~/.local/share/virsh-usb/hids.json` — virtual HID device metadata
+- `~/.local/share/virsh-usb/hid-<name>.*` — daemon state files (pid, port, socket, vhci port)
 
 Virtual drive images are stored in libvirt's default storage pool, typically `/var/lib/libvirt/images/`.
 
@@ -195,14 +203,23 @@ If you see an error about a missing volume, check what's in the default pool:
 virsh vol-list default
 ```
 
+### HID device: "vhci_hcd sysfs directory not found"
+The `vhci-hcd` module is not loaded. Load it manually:
+```bash
+sudo modprobe vhci-hcd
+```
+To load it automatically at boot, see the installation instructions above.
+
+### HID device: "Failed to write to vhci_hcd attach"
+Your user needs write access to the vhci_hcd sysfs files. Install the udev rule and add yourself to the `plugdev` group as described in the Permissions section, then reload the module:
+```bash
+sudo modprobe -r vhci-hcd && sudo modprobe vhci-hcd
+```
+
 ## License
 
-MIT License - see LICENSE file for details.
+MIT License — see LICENSE file for details.
 
 ## Author
 
 Brian Donovan
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues or pull requests.
