@@ -389,8 +389,26 @@ fn attach_device(vm_name: &str, vendor_id: &str, product_id: &str) -> Result<()>
     }
 
     if is_device_attached(vm_name, vendor_id, product_id)? {
-        println!("Device is already attached to {}", vm_name);
-        return Ok(());
+        // The virsh record may be stale (e.g. device was unplugged and
+        // reconnected). Detach first so we can do a clean re-attach.
+        println!(
+            "{} Device already registered with virsh; re-attaching to refresh…",
+            style("!").yellow().bold()
+        );
+        let stale_xml = format!(
+            r#"<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='0x{vendor_id}'/>
+    <product id='0x{product_id}'/>
+  </source>
+</hostdev>
+"#
+        );
+        let temp_file = "/tmp/virsh-usb-detach-stale.xml";
+        if fs::write(temp_file, &stale_xml).is_ok() {
+            let _ = run_command(&["virsh", "detach-device", vm_name, temp_file, "--live"]);
+            let _ = fs::remove_file(temp_file);
+        }
     }
 
     let all_devices = get_all_usb_devices()?;
