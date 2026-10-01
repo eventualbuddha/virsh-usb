@@ -21,11 +21,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[command(about = "Manage USB device attachment to virsh VMs")]
 struct Cli {
     /// Name of the virsh VM (if not provided, will prompt interactively)
-    #[arg(long)]
+    // Global so it is accepted after the subcommand too (`attach --vm x`).
+    // `hid type` declares its own --vm/--device; clap does not propagate a
+    // global into a subcommand that already defines the same option.
+    #[arg(long, global = true)]
     vm: Option<String>,
 
     /// Device: vid:pid for physical USB, or name for virtual storage/HID devices
-    #[arg(long)]
+    #[arg(long, global = true)]
     device: Option<String>,
 
     #[command(subcommand)]
