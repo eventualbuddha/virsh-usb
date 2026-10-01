@@ -12,3 +12,4 @@ directories = "5.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 libc = "0.2"
+clap_complete = "4"

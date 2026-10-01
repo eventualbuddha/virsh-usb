@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use console::style;
 use directories::ProjectDirs;
 use inquire::Select;
@@ -65,6 +65,20 @@ enum Commands {
         pid_file: String,
         #[arg(long)]
         port_file: String,
+    },
+    /// Internal: print a shell completion script to stdout
+    #[command(hide = true)]
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
+    /// Internal: list device names for shell completion, one per line as
+    /// `name<TAB>description`
+    #[command(hide = true)]
+    CompleteDevices {
+        /// Restrict to one kind of device
+        #[arg(long, value_enum, default_value_t = DeviceKind::All)]
+        kind: DeviceKind,
     },
 }
 
@@ -2528,11 +2542,90 @@ fn select_device(vm_name: Option<&str>, filter_attached: bool) -> Result<DeviceC
 }
 
 // ============================================================
+// Shell completion
+// ============================================================
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum DeviceKind {
+    All,
+    Storage,
+    Hid,
+}
+
+/// Fish lines appended to the clap-generated script so `--vm`, `--device`
+/// and the storage/HID `delete` names complete against live values.
+///
+/// `--device` on the top-level commands accepts anything (a host vid:pid or a
+/// virtual device name); under `hid type` only HID device names make sense.
+const FISH_DYNAMIC_COMPLETIONS: &str = r#"
+# --- dynamic values (appended by virsh-usb) ---
+complete -c virsh-usb -l vm -x -a "(virsh list --all --name 2>/dev/null)"
+complete -c virsh-usb -n "not __fish_seen_subcommand_from storage hid" -l device -x -a "(virsh-usb complete-devices 2>/dev/null)"
+complete -c virsh-usb -n "__fish_seen_subcommand_from storage; and __fish_seen_subcommand_from delete" -x -a "(virsh-usb complete-devices --kind storage 2>/dev/null)"
+complete -c virsh-usb -n "__fish_seen_subcommand_from hid; and __fish_seen_subcommand_from delete" -x -a "(virsh-usb complete-devices --kind hid 2>/dev/null)"
+complete -c virsh-usb -n "__fish_seen_subcommand_from hid; and __fish_seen_subcommand_from type" -l device -x -a "(virsh-usb complete-devices --kind hid 2>/dev/null)"
+"#;
+
+/// Write a completion script for `shell` to stdout.
+///
+/// clap_complete honors `hide` on argument values but not on subcommands, so
+/// the script is generated from a copy of the root command that simply omits
+/// them (the HID daemon and the completion helpers themselves).
+fn print_completions(shell: clap_complete::Shell) -> Result<()> {
+    let full = Cli::command();
+    let mut cmd = clap::Command::new("virsh-usb")
+        .args(full.get_arguments().cloned())
+        .subcommands(full.get_subcommands().filter(|c| !c.is_hide_set()).cloned());
+    if let Some(about) = full.get_about() {
+        cmd = cmd.about(about.clone());
+    }
+
+    let mut script = Vec::new();
+    clap_complete::generate(shell, &mut cmd, "virsh-usb", &mut script);
+    if shell == clap_complete::Shell::Fish {
+        script.extend_from_slice(FISH_DYNAMIC_COMPLETIONS.as_bytes());
+    }
+
+    std::io::stdout().write_all(&script)?;
+    Ok(())
+}
+
+/// Print `name<TAB>description` lines for the shell to offer as completions.
+fn complete_devices(kind: DeviceKind) -> Result<()> {
+    let mut lines = Vec::new();
+    if kind == DeviceKind::All {
+        for d in get_all_usb_devices().unwrap_or_default() {
+            lines.push(format!("{}:{}\t{}", d.vendor_id, d.product_id, d.name));
+        }
+    }
+    if matches!(kind, DeviceKind::All | DeviceKind::Storage) {
+        for d in load_virtual_drives().unwrap_or_default() {
+            lines.push(format!("{}\tvirtual storage ({})", d.name, d.size));
+        }
+    }
+    if matches!(kind, DeviceKind::All | DeviceKind::Hid) {
+        for d in load_hid_devices().unwrap_or_default() {
+            lines.push(format!("{}\tvirtual HID ({}:{})", d.name, d.vid, d.pid));
+        }
+    }
+    // The shell may stop reading early; a closed pipe is not worth an error.
+    let _ = std::io::stdout().write_all(lines.join("\n").as_bytes());
+    Ok(())
+}
+
+// ============================================================
 // Entry point
 // ============================================================
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Internal: shell completion support
+    match &cli.command {
+        Commands::Completions { shell } => return print_completions(*shell),
+        Commands::CompleteDevices { kind } => return complete_devices(*kind),
+        _ => {}
+    }
 
     // Internal: HID daemon mode
     if let Commands::HidDaemon {
@@ -2744,7 +2837,9 @@ fn main() -> Result<()> {
         (Commands::Status, SelectedDevice::Hid { name }) => show_hid_status(&vm, &name)?,
         (Commands::Storage { .. }, _)
         | (Commands::Hid { .. }, _)
-        | (Commands::HidDaemon { .. }, _) => {
+        | (Commands::HidDaemon { .. }, _)
+        | (Commands::Completions { .. }, _)
+        | (Commands::CompleteDevices { .. }, _) => {
             unreachable!()
         }
     }

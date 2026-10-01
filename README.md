@@ -31,6 +31,17 @@ cargo build --release
 sudo cp target/release/virsh-usb /usr/local/bin/
 ```
 
+### Shell Completions
+
+The binary generates its own completion scripts. For fish, which also gets
+live completion of VM names, host USB devices and virtual device names:
+
+```bash
+virsh-usb completions fish > ~/.config/fish/completions/virsh-usb.fish
+```
+
+`bash` and `zsh` are accepted too; the Nix package installs all three.
+
 ### Permissions
 
 Add yourself to the `libvirt` group for virsh access:
