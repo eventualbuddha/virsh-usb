@@ -1360,21 +1360,20 @@ fn read_hid_port(name: &str) -> Result<u16> {
 }
 
 fn cleanup_hid_state_files(name: &str) {
-    let _ = hid_pid_file(name).map(|f| fs::remove_file(f));
-    let _ = hid_port_file(name).map(|f| fs::remove_file(f));
-    let _ = hid_sock_file(name).map(|f| fs::remove_file(f));
-    let _ = hid_vhci_port_file(name).map(|f| fs::remove_file(f));
+    let _ = hid_pid_file(name).map(fs::remove_file);
+    let _ = hid_port_file(name).map(fs::remove_file);
+    let _ = hid_sock_file(name).map(fs::remove_file);
+    let _ = hid_vhci_port_file(name).map(fs::remove_file);
 }
 
 fn stop_hid_daemon(name: &str) {
-    if let Ok(pid_file) = hid_pid_file(name) {
-        if let Ok(content) = fs::read_to_string(&pid_file) {
-            if let Ok(pid) = content.trim().parse::<u32>() {
-                let _ = Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status();
-            }
-        }
+    if let Ok(pid_file) = hid_pid_file(name)
+        && let Ok(content) = fs::read_to_string(&pid_file)
+        && let Ok(pid) = content.trim().parse::<u32>()
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
     }
     cleanup_hid_state_files(name);
 }
@@ -1810,27 +1809,25 @@ fn run_hid_daemon(
     // Thread: handle Unix socket connections (key/scan data injection).
     let key_queue_ipc = Arc::clone(&key_queue);
     std::thread::spawn(move || {
-        for stream in unix_listener.incoming() {
-            if let Ok(mut stream) = stream {
-                let kq = Arc::clone(&key_queue_ipc);
-                std::thread::spawn(move || {
-                    let mut buf = Vec::new();
-                    let _ = stream.read_to_end(&mut buf);
-                    if let Ok(text) = std::str::from_utf8(&buf) {
-                        let reports = text_to_scanner_reports(text);
-                        if reports.is_empty() {
-                            return;
-                        }
-                        let mut queue = kq.lock().unwrap();
-                        for report in reports {
-                            queue.push_back(report);
-                        }
-                        drop(queue);
-                        // Wake the transfer loop.
-                        unsafe { libc::write(notify_write_fd, [1u8].as_ptr() as _, 1) };
+        for mut stream in unix_listener.incoming().flatten() {
+            let kq = Arc::clone(&key_queue_ipc);
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = stream.read_to_end(&mut buf);
+                if let Ok(text) = std::str::from_utf8(&buf) {
+                    let reports = text_to_scanner_reports(text);
+                    if reports.is_empty() {
+                        return;
                     }
-                });
-            }
+                    let mut queue = kq.lock().unwrap();
+                    for report in reports {
+                        queue.push_back(report);
+                    }
+                    drop(queue);
+                    // Wake the transfer loop.
+                    unsafe { libc::write(notify_write_fd, [1u8].as_ptr() as _, 1) };
+                }
+            });
         }
     });
 
@@ -1905,16 +1902,16 @@ fn find_free_vhci_port() -> Result<u32> {
         let parts: Vec<&str> = line.split_whitespace().collect();
         // Format: "hub port sta spd dev sockfd local_busid"
         // hub = "hs" or "ss", port = hex, sta = hex status
-        if parts.len() >= 3 && parts[0] == "hs" {
-            if let (Ok(port), Ok(status)) = (
+        if parts.len() >= 3
+            && parts[0] == "hs"
+            && let (Ok(port), Ok(status)) = (
                 u32::from_str_radix(parts[1], 16),
                 u32::from_str_radix(parts[2], 16),
-            ) {
-                if status == 0x04 {
-                    // VDEV_ST_NULL = available
-                    return Ok(port);
-                }
-            }
+            )
+            && status == 0x04
+        {
+            // VDEV_ST_NULL = available
+            return Ok(port);
         }
     }
     Err(anyhow!("No free vhci_hcd ports available"))
