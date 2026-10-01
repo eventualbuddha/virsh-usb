@@ -806,8 +806,13 @@ fn get_all_usb_devices() -> Result<Vec<UsbDevice>> {
             (None, None) => String::new(),
         };
 
-        // Devices without string descriptors: fall back to the usb.ids
-        // database via `lsusb` when it happens to be installed.
+        // Devices without string descriptors (the Fujitsu fi-8170 scanner,
+        // for one): ask systemd's hardware database via `udevadm`, which is
+        // on every systemd host, then the usb.ids database via `lsusb` when
+        // it happens to be installed.
+        if name.is_empty() {
+            name = hwdb_name(&dir).unwrap_or_default();
+        }
         if name.is_empty() {
             let names = lsusb_names.get_or_insert_with(lsusb_name_table);
             name = names
@@ -828,6 +833,37 @@ fn get_all_usb_devices() -> Result<Vec<UsbDevice>> {
 
     devices.sort_by(|a, b| (&a.bus, &a.device).cmp(&(&b.bus, &b.device)));
     Ok(devices)
+}
+
+/// Vendor and model of a USB device from systemd's hardware database
+/// (`ID_VENDOR_FROM_DATABASE` / `ID_MODEL_FROM_DATABASE`), or None when
+/// `udevadm` is unavailable or the database does not know the device.
+fn hwdb_name(sysfs_dir: &Path) -> Option<String> {
+    let output = Command::new("udevadm")
+        .args(["info", "--query=property", "--path"])
+        .arg(sysfs_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut vendor = None;
+    let mut model = None;
+    for line in stdout.lines() {
+        if let Some(v) = line.strip_prefix("ID_VENDOR_FROM_DATABASE=") {
+            vendor = Some(v.trim());
+        } else if let Some(m) = line.strip_prefix("ID_MODEL_FROM_DATABASE=") {
+            model = Some(m.trim());
+        }
+    }
+    let name = match (vendor, model) {
+        (Some(v), Some(m)) => format!("{} {}", v, m),
+        (Some(v), None) => v.to_string(),
+        (None, Some(m)) => m.to_string(),
+        (None, None) => return None,
+    };
+    Some(name).filter(|n| !n.is_empty())
 }
 
 /// Map of (vendor_id, product_id) -> descriptive name from `lsusb`, or an

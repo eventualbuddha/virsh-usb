@@ -18,7 +18,7 @@ A command-line tool for managing USB device attachment to virsh (libvirt/KVM) VM
 
 - Linux system with libvirt/KVM installed
 - `virsh` command-line tool
-- `lsusb` (from `usbutils`) is optional: it is only used to look up names for devices that lack USB string descriptors
+- `lsusb` (from `usbutils`) is optional: devices that lack USB string descriptors are named from systemd's hardware database via `udevadm`, with `lsusb` as a last resort
 - `vhci-hcd` kernel module (for virtual HID devices)
 - Rust toolchain (for building from source)
 
