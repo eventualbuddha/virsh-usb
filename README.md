@@ -18,7 +18,7 @@ A command-line tool for managing USB device attachment to virsh (libvirt/KVM) VM
 
 - Linux system with libvirt/KVM installed
 - `virsh` command-line tool
-- `lsusb` utility (usually from the `usbutils` package)
+- `lsusb` (from `usbutils`) is optional: it is only used to look up names for devices that lack USB string descriptors
 - `vhci-hcd` kernel module (for virtual HID devices)
 - Rust toolchain (for building from source)
 
@@ -157,7 +157,7 @@ When you run commands without device flags, the tool prompts you interactively:
 
 ### Physical USB Passthrough
 
-Uses `virsh attach-device` / `virsh detach-device` with a USB hostdev XML definition. Device information is retrieved with `lsusb`.
+Uses `virsh attach-device` / `virsh detach-device` with a USB hostdev XML definition. Device information is read directly from sysfs (`/sys/bus/usb/devices`), so `lsusb` is not required.
 
 ### Virtual Storage Drives
 
@@ -169,13 +169,27 @@ Uses the USB/IP protocol and the `vhci-hcd` kernel module:
 
 1. A daemon process implements a USB/IP server that emulates a HID keyboard with the configured VID/PID
 2. The main process performs the USB/IP IMPORT handshake, then passes the socket to `vhci_hcd` via sysfs
-3. The device appears in `lsusb` with the correct VID/PID
+3. The device appears on the host USB bus (visible in sysfs and `lsusb`) with the correct VID/PID
 4. `virsh attach-device` passes it through to the guest VM
 5. `virsh-usb hid type` sends text to the daemon via a Unix socket, which injects HID key reports
 
 Daemon state files are stored in `~/.local/share/virsh-usb/`.
 
 ## Configuration
+
+### libvirt connection
+
+All `virsh` calls go to `qemu:///system` by default, since that is where
+system VMs and the default storage pool live. Plain `virsh` would otherwise
+default to `qemu:///session`, which has its own separate (usually empty) set of
+domains. To use a different connection, set `VIRSH_DEFAULT_CONNECT_URI` (or
+`LIBVIRT_DEFAULT_URI`) and it is honored instead:
+
+```bash
+VIRSH_DEFAULT_CONNECT_URI=qemu:///session virsh-usb attach
+```
+
+### Files
 
 The tool stores data in:
 
@@ -192,7 +206,7 @@ Virtual drive images are stored in libvirt's default storage pool, typically `/v
 The VM must be running (not paused or stopped) to attach or detach devices.
 
 ### "USB device not found"
-Make sure the USB device is physically connected to your host. Run `lsusb` to verify.
+Make sure the USB device is physically connected to your host. Run `lsusb` or `ls /sys/bus/usb/devices` to verify. If the interactive picker prints a warning about enumerating host devices, `/sys/bus/usb` is not readable on your system.
 
 ### "Permission denied" / libvirt access errors
 Ensure your user is in the `libvirt` group (see Permissions above).

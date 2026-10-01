@@ -4,7 +4,7 @@ use console::style;
 use directories::ProjectDirs;
 use inquire::Select;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -273,20 +273,46 @@ fn sanitize_device_name(name: &str) -> String {
 // Core helpers
 // ============================================================
 
+/// The libvirt connection VMs are managed on.
+///
+/// Plain `virsh` defaults to `qemu:///session`, which has its own (usually
+/// empty) set of domains, so VMs defined in the system instance are invisible.
+/// Honor the standard libvirt environment variables when they are set,
+/// otherwise connect to the system instance.
+fn libvirt_uri() -> Option<String> {
+    for var in ["VIRSH_DEFAULT_CONNECT_URI", "LIBVIRT_DEFAULT_URI"] {
+        match std::env::var(var) {
+            // Already set, so let virsh pick the URI up itself.
+            Ok(uri) if !uri.trim().is_empty() => return None,
+            _ => {}
+        }
+    }
+    Some("qemu:///system".to_string())
+}
+
 fn run_command(args: &[&str]) -> Result<String> {
     if args.is_empty() {
         return Err(anyhow!("Command arguments cannot be empty"));
     }
 
-    let output = Command::new(args[0])
-        .args(&args[1..])
+    // Pin virsh to the right libvirt instance unless the caller already did.
+    let mut argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    if args[0] == "virsh"
+        && !args.iter().any(|a| *a == "-c" || *a == "--connect")
+        && let Some(uri) = libvirt_uri()
+    {
+        argv.splice(1..1, ["--connect".to_string(), uri]);
+    }
+
+    let output = Command::new(&argv[0])
+        .args(&argv[1..])
         .output()
-        .context(format!("Failed to execute command: {}", args.join(" ")))?;
+        .context(format!("Failed to execute command: {}", argv.join(" ")))?;
 
     if !output.status.success() {
         return Err(anyhow!(
             "Command failed: {}\nError: {}",
-            args.join(" "),
+            argv.join(" "),
             String::from_utf8_lossy(&output.stderr)
         ));
     }
@@ -295,20 +321,12 @@ fn run_command(args: &[&str]) -> Result<String> {
 }
 
 fn find_usb_device(vendor_id: &str, product_id: &str) -> Result<Option<(String, String)>> {
-    let output = run_command(&["lsusb"])?;
-
-    for line in output.lines() {
-        if line.contains(&format!("{}:{}", vendor_id, product_id)) {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                let bus = parts[1].to_string();
-                let device = parts[3].trim_end_matches(':').to_string();
-                return Ok(Some((bus, device)));
-            }
-        }
-    }
-
-    Ok(None)
+    let vendor_id = vendor_id.to_lowercase();
+    let product_id = product_id.to_lowercase();
+    Ok(get_all_usb_devices()?
+        .into_iter()
+        .find(|d| d.vendor_id == vendor_id && d.product_id == product_id)
+        .map(|d| (d.bus, d.device)))
 }
 
 fn check_vm_running(vm_name: &str) -> Result<bool> {
@@ -333,8 +351,7 @@ fn get_attached_devices(vm_name: &str) -> Result<Vec<(String, String)>> {
         if trimmed.contains("<hostdev") && trimmed.contains("usb") {
             in_hostdev = true;
         } else if trimmed.contains("</hostdev>") {
-            if in_hostdev
-                && let (Some(vendor), Some(product)) = (&current_vendor, &current_product)
+            if in_hostdev && let (Some(vendor), Some(product)) = (&current_vendor, &current_product)
             {
                 devices.push((vendor.clone(), product.clone()));
             }
@@ -592,8 +609,8 @@ fn load_virtual_drives() -> Result<Vec<VirtualDrive>> {
     if !path.exists() {
         return Ok(vec![]);
     }
-    let content = fs::read_to_string(&path)
-        .context(format!("Failed to read {}", path.display()))?;
+    let content =
+        fs::read_to_string(&path).context(format!("Failed to read {}", path.display()))?;
     serde_json::from_str(&content).context(format!(
         "Failed to parse drives.json. The file may be corrupted. You can delete it at: {}",
         path.display()
@@ -616,8 +633,8 @@ fn load_hid_devices() -> Result<Vec<HidDevice>> {
     if !path.exists() {
         return Ok(vec![]);
     }
-    let content = fs::read_to_string(&path)
-        .context(format!("Failed to read {}", path.display()))?;
+    let content =
+        fs::read_to_string(&path).context(format!("Failed to read {}", path.display()))?;
     serde_json::from_str(&content).context(format!(
         "Failed to parse hid-devices.json. The file may be corrupted. You can delete it at: {}",
         path.display()
@@ -673,7 +690,13 @@ fn select_vm() -> Result<String> {
     let vms = get_all_vms()?;
 
     if vms.is_empty() {
-        return Err(anyhow!("No VMs found"));
+        let uri = run_command(&["virsh", "uri"])
+            .map(|u| u.trim().to_string())
+            .unwrap_or_else(|_| "the current libvirt connection".to_string());
+        return Err(anyhow!(
+            "No VMs found on {}. Set VIRSH_DEFAULT_CONNECT_URI to use a different libvirt connection.",
+            uri
+        ));
     }
 
     let last_vm = load_last_vm();
@@ -704,37 +727,107 @@ struct UsbDevice {
     attached: bool,
 }
 
+const SYSFS_USB_DEVICES: &str = "/sys/bus/usb/devices";
+
+/// Read a single sysfs attribute, trimming the trailing newline.
+fn read_sysfs_attr(dir: &Path, attr: &str) -> Option<String> {
+    fs::read_to_string(dir.join(attr))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Enumerate USB devices on the host by reading sysfs directly.
+///
+/// This avoids a runtime dependency on `lsusb` (the `usbutils` package),
+/// which is not installed by default on some distributions such as NixOS.
+/// Bus and device numbers are zero-padded to three digits to match the
+/// `lsusb` / `/dev/bus/usb/BBB/DDD` convention the rest of the code expects.
 fn get_all_usb_devices() -> Result<Vec<UsbDevice>> {
-    let output = run_command(&["lsusb"])?;
+    let entries = fs::read_dir(SYSFS_USB_DEVICES)
+        .with_context(|| format!("Failed to read {}", SYSFS_USB_DEVICES))?;
+
     let mut devices = Vec::new();
+    let mut lsusb_names: Option<HashMap<(String, String), String>> = None;
 
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 6 {
-            let bus = parts[1].to_string();
-            let device = parts[3].trim_end_matches(':').to_string();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let file_name = entry.file_name();
+        let entry_name = file_name.to_string_lossy();
 
-            if let Some(id_part) = parts.get(5) {
-                let id_parts: Vec<&str> = id_part.split(':').collect();
-                if id_parts.len() == 2 {
-                    let vendor_id = id_parts[0].to_string();
-                    let product_id = id_parts[1].to_string();
-                    let name = parts[6..].join(" ");
-
-                    devices.push(UsbDevice {
-                        bus,
-                        device,
-                        vendor_id,
-                        product_id,
-                        name,
-                        attached: false,
-                    });
-                }
-            }
+        // Interface entries look like "1-1.2:1.0"; devices have no colon.
+        if entry_name.contains(':') {
+            continue;
         }
+
+        let (Some(busnum), Some(devnum), Some(vendor_id), Some(product_id)) = (
+            read_sysfs_attr(&dir, "busnum"),
+            read_sysfs_attr(&dir, "devnum"),
+            read_sysfs_attr(&dir, "idVendor"),
+            read_sysfs_attr(&dir, "idProduct"),
+        ) else {
+            continue;
+        };
+        let (Ok(busnum), Ok(devnum)) = (busnum.parse::<u32>(), devnum.parse::<u32>()) else {
+            continue;
+        };
+        let vendor_id = vendor_id.to_lowercase();
+        let product_id = product_id.to_lowercase();
+
+        let manufacturer = read_sysfs_attr(&dir, "manufacturer");
+        let product = read_sysfs_attr(&dir, "product");
+        let mut name = match (manufacturer, product) {
+            (Some(m), Some(p)) if p.to_lowercase().starts_with(&m.to_lowercase()) => p,
+            (Some(m), Some(p)) => format!("{} {}", m, p),
+            (Some(m), None) => m,
+            (None, Some(p)) => p,
+            (None, None) => String::new(),
+        };
+
+        // Devices without string descriptors: fall back to the usb.ids
+        // database via `lsusb` when it happens to be installed.
+        if name.is_empty() {
+            let names = lsusb_names.get_or_insert_with(lsusb_name_table);
+            name = names
+                .get(&(vendor_id.clone(), product_id.clone()))
+                .cloned()
+                .unwrap_or_else(|| "Unknown device".to_string());
+        }
+
+        devices.push(UsbDevice {
+            bus: format!("{:03}", busnum),
+            device: format!("{:03}", devnum),
+            vendor_id,
+            product_id,
+            name,
+            attached: false,
+        });
     }
 
+    devices.sort_by(|a, b| (&a.bus, &a.device).cmp(&(&b.bus, &b.device)));
     Ok(devices)
+}
+
+/// Map of (vendor_id, product_id) -> descriptive name from `lsusb`, or an
+/// empty map when `lsusb` is not installed.
+fn lsusb_name_table() -> HashMap<(String, String), String> {
+    let mut table = HashMap::new();
+    let Ok(output) = run_command(&["lsusb"]) else {
+        return table;
+    };
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 7 {
+            continue;
+        }
+        if let Some((vid, pid)) = parts[5].split_once(':') {
+            table.insert(
+                (vid.to_lowercase(), pid.to_lowercase()),
+                parts[6..].join(" "),
+            );
+        }
+    }
+    table
 }
 
 fn find_device_by_name(
@@ -796,7 +889,10 @@ fn find_device_by_name(
                 .position(|s| s == &selection)
                 .ok_or_else(|| anyhow!("Selected device not found"))?;
 
-            Ok((matches[idx].vendor_id.clone(), matches[idx].product_id.clone()))
+            Ok((
+                matches[idx].vendor_id.clone(),
+                matches[idx].product_id.clone(),
+            ))
         }
     }
 }
@@ -829,7 +925,8 @@ fn get_attached_virtual_devices(vm_name: &str) -> Result<Vec<VirtualAttachment>>
             current_target = None;
             current_is_usb = false;
         } else if trimmed == "</disk>" {
-            if in_disk && current_is_usb
+            if in_disk
+                && current_is_usb
                 && let (Some(src), Some(tgt)) = (current_source.take(), current_target.take())
             {
                 attachments.push(VirtualAttachment {
@@ -912,7 +1009,13 @@ fn create_virtual_drive(name: &str, size: &str) -> Result<()> {
 
     let vol_name = format!("{}.qcow2", name);
     run_command(&[
-        "virsh", "vol-create-as", "default", &vol_name, size, "--format", "qcow2",
+        "virsh",
+        "vol-create-as",
+        "default",
+        &vol_name,
+        size,
+        "--format",
+        "qcow2",
     ])?;
 
     let created_at_secs = SystemTime::now()
@@ -947,11 +1050,7 @@ fn delete_virtual_drive(name: &str) -> Result<()> {
 
     let running_vms = run_command(&["virsh", "list", "--name"]).unwrap_or_default();
     let drive = &drives[idx];
-    for vm in running_vms
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    for vm in running_vms.lines().map(str::trim).filter(|s| !s.is_empty()) {
         if is_virtual_drive_attached(vm, drive)? {
             return Err(anyhow!(
                 "Storage drive '{}' is currently attached to VM '{}'. Detach it first.",
@@ -1200,15 +1299,15 @@ fn show_virtual_status(vm_name: &str, drive_name: &str) -> Result<()> {
 // raw HID mode where each report carries up to 8 bytes of barcode ASCII data.
 const HID_SCANNER_REPORT_DESC: &[u8] = &[
     0x06, 0x00, 0xFF, // Usage Page (Vendor-Defined 0xFF00)
-    0x09, 0x01,       // Usage (0x01)
-    0xA1, 0x01,       // Collection (Application)
-    0x09, 0x01,       //   Usage (0x01)
-    0x15, 0x00,       //   Logical Minimum (0)
+    0x09, 0x01, // Usage (0x01)
+    0xA1, 0x01, // Collection (Application)
+    0x09, 0x01, //   Usage (0x01)
+    0x15, 0x00, //   Logical Minimum (0)
     0x26, 0xFF, 0x00, //   Logical Maximum (255)
-    0x75, 0x08,       //   Report Size (8)
-    0x95, 0x08,       //   Report Count (8) — 8 raw bytes per report
-    0x81, 0x02,       //   Input (Data, Variable, Absolute)
-    0xC0,             // End Collection
+    0x75, 0x08, //   Report Size (8)
+    0x95, 0x08, //   Report Count (8) — 8 raw bytes per report
+    0x81, 0x02, //   Input (Data, Variable, Absolute)
+    0xC0, // End Collection
 ];
 
 // ============================================================
@@ -1252,8 +1351,8 @@ fn is_hid_daemon_running(name: &str) -> bool {
 
 fn read_hid_port(name: &str) -> Result<u16> {
     let port_file = hid_port_file(name)?;
-    let content =
-        fs::read_to_string(&port_file).context("Daemon port file not found — daemon not running?")?;
+    let content = fs::read_to_string(&port_file)
+        .context("Daemon port file not found — daemon not running?")?;
     content
         .trim()
         .parse::<u16>()
@@ -1401,7 +1500,11 @@ fn clear_ep_halt(bus: &str, dev: &str, endpoint: u32) {
         return;
     };
     unsafe {
-        libc::ioctl(file.as_raw_fd(), USBDEVFS_CLEAR_HALT, &endpoint as *const u32);
+        libc::ioctl(
+            file.as_raw_fd(),
+            USBDEVFS_CLEAR_HALT,
+            &endpoint as *const u32,
+        );
     }
 }
 
@@ -1427,9 +1530,9 @@ fn usbip_device_info(vid: u16, pid: u16) -> Vec<u8> {
     d.push(0x00); // bDeviceClass
     d.push(0x00); // bDeviceSubClass
     d.push(0x00); // bDeviceProtocol
-    d.push(1);    // bConfigurationValue
-    d.push(1);    // bNumConfigurations
-    d.push(1);    // bNumInterfaces
+    d.push(1); // bConfigurationValue
+    d.push(1); // bNumConfigurations
+    d.push(1); // bNumInterfaces
     d
 }
 
@@ -1537,8 +1640,16 @@ fn handle_usb_transfers(
         if let Some(ref pend) = pending {
             // EP1 IN is parked. Poll for a key-data notification or a CMD_UNLINK.
             let mut pfds = [
-                libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: notify_read_fd,     events: libc::POLLIN, revents: 0 },
+                libc::pollfd {
+                    fd: stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: notify_read_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
             if unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) } <= 0 {
                 continue; // EINTR or transient error — retry
@@ -1549,7 +1660,8 @@ fn handle_usb_transfers(
                 let mut drain = [0u8; 64];
                 unsafe { libc::read(notify_read_fd, drain.as_mut_ptr() as _, drain.len()) };
                 if let Some(report) = key_queue.lock().unwrap().pop_front() {
-                    if !send_ret_submit(stream, pend.seqnum, pend.devid, 1, 1, &pend.setup, &report) {
+                    if !send_ret_submit(stream, pend.seqnum, pend.devid, 1, 1, &pend.setup, &report)
+                    {
                         break;
                     }
                     pending = None;
@@ -1564,12 +1676,12 @@ fn handle_usb_transfers(
                 if stream.read_exact(&mut hdr).is_err() {
                     break;
                 }
-                let command  = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
-                let seqnum   = u32::from_be_bytes(hdr[4..8].try_into().unwrap());
-                let devid    = u32::from_be_bytes(hdr[8..12].try_into().unwrap());
+                let command = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
+                let seqnum = u32::from_be_bytes(hdr[4..8].try_into().unwrap());
+                let devid = u32::from_be_bytes(hdr[8..12].try_into().unwrap());
                 let direction = u32::from_be_bytes(hdr[12..16].try_into().unwrap());
-                let ep       = u32::from_be_bytes(hdr[16..20].try_into().unwrap());
-                let buf_len  = u32::from_be_bytes(hdr[24..28].try_into().unwrap());
+                let ep = u32::from_be_bytes(hdr[16..20].try_into().unwrap());
+                let buf_len = u32::from_be_bytes(hdr[24..28].try_into().unwrap());
                 let setup: [u8; 8] = hdr[40..48].try_into().unwrap();
 
                 match command {
@@ -1592,7 +1704,8 @@ fn handle_usb_transfers(
                         }
                         if ep == 0 {
                             let resp = handle_control_request(&setup, vid, pid, device_name);
-                            if !send_ret_submit(stream, seqnum, devid, direction, ep, &setup, &resp) {
+                            if !send_ret_submit(stream, seqnum, devid, direction, ep, &setup, &resp)
+                            {
                                 break;
                             }
                         }
@@ -1607,12 +1720,12 @@ fn handle_usb_transfers(
             if stream.read_exact(&mut hdr).is_err() {
                 break;
             }
-            let command   = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
-            let seqnum    = u32::from_be_bytes(hdr[4..8].try_into().unwrap());
-            let devid     = u32::from_be_bytes(hdr[8..12].try_into().unwrap());
+            let command = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
+            let seqnum = u32::from_be_bytes(hdr[4..8].try_into().unwrap());
+            let devid = u32::from_be_bytes(hdr[8..12].try_into().unwrap());
             let direction = u32::from_be_bytes(hdr[12..16].try_into().unwrap());
-            let ep        = u32::from_be_bytes(hdr[16..20].try_into().unwrap());
-            let buf_len   = u32::from_be_bytes(hdr[24..28].try_into().unwrap());
+            let ep = u32::from_be_bytes(hdr[16..20].try_into().unwrap());
+            let buf_len = u32::from_be_bytes(hdr[24..28].try_into().unwrap());
             let setup: [u8; 8] = hdr[40..48].try_into().unwrap();
 
             match command {
@@ -1630,7 +1743,11 @@ fn handle_usb_transfers(
                         match key_queue.lock().unwrap().pop_front() {
                             Some(report) => report.to_vec(),
                             None => {
-                                pending = Some(PendingEp1In { seqnum, devid, setup });
+                                pending = Some(PendingEp1In {
+                                    seqnum,
+                                    devid,
+                                    setup,
+                                });
                                 continue;
                             }
                         }
@@ -1661,20 +1778,10 @@ fn run_hid_daemon(
     pid_file_path: &str,
     port_file_path: &str,
 ) -> Result<()> {
-    let vid = u16::from_str_radix(
-        vid_str
-            .to_lowercase()
-            .trim_start_matches("0x"),
-        16,
-    )
-    .context("Invalid VID")?;
-    let pid_val = u16::from_str_radix(
-        pid_str
-            .to_lowercase()
-            .trim_start_matches("0x"),
-        16,
-    )
-    .context("Invalid PID")?;
+    let vid = u16::from_str_radix(vid_str.to_lowercase().trim_start_matches("0x"), 16)
+        .context("Invalid VID")?;
+    let pid_val = u16::from_str_radix(pid_str.to_lowercase().trim_start_matches("0x"), 16)
+        .context("Invalid PID")?;
 
     // Bind TCP listener on a random port
     let tcp_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -1792,8 +1899,7 @@ fn find_vhci_sysfs_dir() -> Result<PathBuf> {
 fn find_free_vhci_port() -> Result<u32> {
     let vhci_dir = find_vhci_sysfs_dir()?;
     let status_path = vhci_dir.join("status");
-    let content = fs::read_to_string(&status_path)
-        .context("Failed to read vhci_hcd status")?;
+    let content = fs::read_to_string(&status_path).context("Failed to read vhci_hcd status")?;
 
     for line in content.lines().skip(1) {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -1842,7 +1948,10 @@ fn detach_vhci(name: &str) -> Result<()> {
         return Ok(());
     }
     let content = fs::read_to_string(&port_file)?;
-    let port: u32 = content.trim().parse().context("Invalid vhci port in state file")?;
+    let port: u32 = content
+        .trim()
+        .parse()
+        .context("Invalid vhci port in state file")?;
 
     let vhci_dir = find_vhci_sysfs_dir()?;
     fs::write(vhci_dir.join("detach"), format!("{}\n", port))
@@ -2083,18 +2192,24 @@ fn attach_hid_device(vm_name: &str, device_name: &str) -> Result<()> {
         let mut busid_buf = [0u8; 32];
         busid_buf[..HID_BUSID.len()].copy_from_slice(HID_BUSID.as_bytes());
         import_req.extend_from_slice(&busid_buf);
-        (&stream).write_all(&import_req).context("Failed to send IMPORT request")?;
+        (&stream)
+            .write_all(&import_req)
+            .context("Failed to send IMPORT request")?;
 
         // Read OP_REP_IMPORT header (8 bytes)
         let mut rep_hdr = [0u8; 8];
-        (&stream).read_exact(&mut rep_hdr).context("Failed to read IMPORT reply")?;
+        (&stream)
+            .read_exact(&mut rep_hdr)
+            .context("Failed to read IMPORT reply")?;
         let status = u32::from_be_bytes([rep_hdr[4], rep_hdr[5], rep_hdr[6], rep_hdr[7]]);
         if status != 0 {
             return Err(anyhow!("USB/IP daemon rejected IMPORT (status={})", status));
         }
         // Read and discard 312-byte device info
         let mut dev_info = [0u8; 312];
-        (&stream).read_exact(&mut dev_info).context("Failed to read device info")?;
+        (&stream)
+            .read_exact(&mut dev_info)
+            .context("Failed to read device info")?;
 
         // Find a free vhci port and attach via sysfs
         let vhci_dir = find_vhci_sysfs_dir()?;
@@ -2110,7 +2225,7 @@ fn attach_hid_device(vm_name: &str, device_name: &str) -> Result<()> {
         drop(unsafe { TcpStream::from_raw_fd(sockfd) });
         attach_result?;
 
-        // Wait up to 5s for device to appear in lsusb
+        // Wait up to 5s for device to appear on the host USB bus (sysfs)
         let mut usb_loc: Option<(String, String)> = None;
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2274,8 +2389,8 @@ fn hid_type(vm_name: &str, device_name: &str, text: &str, no_enter: bool) -> Res
     }
 
     let sock_file = hid_sock_file(device_name)?;
-    let mut stream = UnixStream::connect(&sock_file)
-        .context("Failed to connect to HID daemon socket")?;
+    let mut stream =
+        UnixStream::connect(&sock_file).context("Failed to connect to HID daemon socket")?;
 
     let mut payload = text.to_string();
     if !no_enter {
@@ -2302,7 +2417,17 @@ fn hid_type(vm_name: &str, device_name: &str, text: &str, no_enter: bool) -> Res
 // ============================================================
 
 fn select_device(vm_name: Option<&str>, filter_attached: bool) -> Result<DeviceChoice> {
-    let mut usb_devices = get_all_usb_devices().unwrap_or_default();
+    let mut usb_devices = match get_all_usb_devices() {
+        Ok(devices) => devices,
+        Err(e) => {
+            eprintln!(
+                "{} Could not enumerate host USB devices: {:#}",
+                style("⚠").yellow(),
+                e
+            );
+            Vec::new()
+        }
+    };
     let attached_usb = vm_name
         .map(|vm| get_attached_devices(vm).unwrap_or_default())
         .unwrap_or_default();
@@ -2490,9 +2615,16 @@ fn main() -> Result<()> {
 
     // Resolve what device the user wants to operate on
     enum SelectedDevice {
-        RealUsb { vendor_id: String, product_id: String },
-        Storage { name: String },
-        Hid { name: String },
+        RealUsb {
+            vendor_id: String,
+            product_id: String,
+        },
+        Storage {
+            name: String,
+        },
+        Hid {
+            name: String,
+        },
     }
 
     let selected = if let Some(device_spec) = cli.device {
@@ -2512,8 +2644,8 @@ fn main() -> Result<()> {
 
         if looks_like_vid_pid {
             SelectedDevice::RealUsb {
-                vendor_id: parts[0].to_string(),
-                product_id: parts[1].to_string(),
+                vendor_id: normalize_hex_id(parts[0]),
+                product_id: normalize_hex_id(parts[1]),
             }
         } else {
             // Named device: check storage and HID first (exact match), then USB by name
@@ -2586,28 +2718,36 @@ fn main() -> Result<()> {
     };
 
     match (&cli.command, selected) {
-        (Commands::Attach, SelectedDevice::RealUsb { vendor_id, product_id }) => {
-            attach_device(&vm, &vendor_id, &product_id)?
-        }
-        (Commands::Detach, SelectedDevice::RealUsb { vendor_id, product_id }) => {
-            detach_device(&vm, &vendor_id, &product_id)?
-        }
-        (Commands::Status, SelectedDevice::RealUsb { vendor_id, product_id }) => {
-            show_status(&vm, &vendor_id, &product_id)?
-        }
-        (Commands::Attach, SelectedDevice::Storage { name }) => {
-            attach_virtual_drive(&vm, &name)?
-        }
-        (Commands::Detach, SelectedDevice::Storage { name }) => {
-            detach_virtual_drive(&vm, &name)?
-        }
-        (Commands::Status, SelectedDevice::Storage { name }) => {
-            show_virtual_status(&vm, &name)?
-        }
+        (
+            Commands::Attach,
+            SelectedDevice::RealUsb {
+                vendor_id,
+                product_id,
+            },
+        ) => attach_device(&vm, &vendor_id, &product_id)?,
+        (
+            Commands::Detach,
+            SelectedDevice::RealUsb {
+                vendor_id,
+                product_id,
+            },
+        ) => detach_device(&vm, &vendor_id, &product_id)?,
+        (
+            Commands::Status,
+            SelectedDevice::RealUsb {
+                vendor_id,
+                product_id,
+            },
+        ) => show_status(&vm, &vendor_id, &product_id)?,
+        (Commands::Attach, SelectedDevice::Storage { name }) => attach_virtual_drive(&vm, &name)?,
+        (Commands::Detach, SelectedDevice::Storage { name }) => detach_virtual_drive(&vm, &name)?,
+        (Commands::Status, SelectedDevice::Storage { name }) => show_virtual_status(&vm, &name)?,
         (Commands::Attach, SelectedDevice::Hid { name }) => attach_hid_device(&vm, &name)?,
         (Commands::Detach, SelectedDevice::Hid { name }) => detach_hid_device(&vm, &name)?,
         (Commands::Status, SelectedDevice::Hid { name }) => show_hid_status(&vm, &name)?,
-        (Commands::Storage { .. }, _) | (Commands::Hid { .. }, _) | (Commands::HidDaemon { .. }, _) => {
+        (Commands::Storage { .. }, _)
+        | (Commands::Hid { .. }, _)
+        | (Commands::HidDaemon { .. }, _) => {
             unreachable!()
         }
     }
