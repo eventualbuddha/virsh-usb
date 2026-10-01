@@ -82,6 +82,11 @@ enum Commands {
         /// Restrict to one kind of device
         #[arg(long, value_enum, default_value_t = DeviceKind::All)]
         kind: DeviceKind,
+        /// Which command the names are for: `detach` lists only devices
+        /// attached to the VM, `attach` lists all and marks attached ones.
+        /// The VM is the global --vm, else the last one used.
+        #[arg(long = "for", value_enum)]
+        purpose: Option<CompletePurpose>,
     },
 }
 
@@ -2560,10 +2565,30 @@ enum DeviceKind {
 ///
 /// `--device` on the top-level commands accepts anything (a host vid:pid or a
 /// virtual device name); under `hid type` only HID device names make sense.
+/// For `attach`/`detach` the candidates depend on what is attached to the VM,
+/// so `__virsh_usb_vm_arg` forwards a `--vm` already on the command line.
 const FISH_DYNAMIC_COMPLETIONS: &str = r#"
 # --- dynamic values (appended by virsh-usb) ---
+function __virsh_usb_vm_arg
+    # Echo "--vm <name>" (one token per line) if the command line has one.
+    set -l tokens (commandline -opc)
+    for i in (seq (count $tokens))
+        switch $tokens[$i]
+            case --vm
+                if set -q tokens[(math $i + 1)]
+                    printf '%s\n' --vm $tokens[(math $i + 1)]
+                end
+                return
+            case '--vm=*'
+                printf '%s\n' --vm (string replace -- '--vm=' '' $tokens[$i])
+                return
+        end
+    end
+end
 complete -c virsh-usb -l vm -x -a "(virsh list --all --name 2>/dev/null)"
-complete -c virsh-usb -n "not __fish_seen_subcommand_from storage hid" -l device -x -a "(virsh-usb complete-devices 2>/dev/null)"
+complete -c virsh-usb -n "__fish_seen_subcommand_from attach" -l device -x -a "(virsh-usb complete-devices --for attach (__virsh_usb_vm_arg) 2>/dev/null)"
+complete -c virsh-usb -n "__fish_seen_subcommand_from detach" -l device -x -a "(virsh-usb complete-devices --for detach (__virsh_usb_vm_arg) 2>/dev/null)"
+complete -c virsh-usb -n "not __fish_seen_subcommand_from attach detach storage hid" -l device -x -a "(virsh-usb complete-devices 2>/dev/null)"
 complete -c virsh-usb -n "__fish_seen_subcommand_from storage; and __fish_seen_subcommand_from delete" -x -a "(virsh-usb complete-devices --kind storage 2>/dev/null)"
 complete -c virsh-usb -n "__fish_seen_subcommand_from hid; and __fish_seen_subcommand_from delete" -x -a "(virsh-usb complete-devices --kind hid 2>/dev/null)"
 complete -c virsh-usb -n "__fish_seen_subcommand_from hid; and __fish_seen_subcommand_from type" -l device -x -a "(virsh-usb complete-devices --kind hid 2>/dev/null)"
@@ -2593,24 +2618,120 @@ fn print_completions(shell: clap_complete::Shell) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CompletePurpose {
+    Attach,
+    Detach,
+}
+
+/// What is currently attached to `vm_name`, for filtering completions.
+struct AttachedState {
+    /// (vendor_id, product_id) of USB hostdevs, lowercase.
+    usb: Vec<(String, String)>,
+    /// Image paths of USB disks.
+    disk_sources: Vec<String>,
+}
+
+impl AttachedState {
+    fn load(vm_name: &str) -> Self {
+        Self {
+            usb: get_attached_devices(vm_name).unwrap_or_default(),
+            disk_sources: get_attached_virtual_devices(vm_name)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|a| a.source_file)
+                .collect(),
+        }
+    }
+
+    fn has_usb(&self, vid: &str, pid: &str) -> bool {
+        let (vid, pid) = (normalize_hex_id(vid), normalize_hex_id(pid));
+        self.usb.iter().any(|(v, p)| *v == vid && *p == pid)
+    }
+
+    fn has_drive(&self, drive: &VirtualDrive) -> bool {
+        // Match on the image file name rather than `virsh vol-path` so this
+        // costs no extra virsh round trip per drive on every tab press.
+        let file_name = format!("{}.qcow2", drive.name);
+        self.disk_sources.iter().any(|s| {
+            Path::new(s)
+                .file_name()
+                .is_some_and(|f| f == file_name.as_str())
+        })
+    }
+
+    fn has_hid(&self, device: &HidDevice) -> bool {
+        is_hid_daemon_running(&device.name) && self.has_usb(&device.vid, &device.pid)
+    }
+}
+
 /// Print `name<TAB>description` lines for the shell to offer as completions.
-fn complete_devices(kind: DeviceKind) -> Result<()> {
-    let mut lines = Vec::new();
+///
+/// With a `purpose`, candidates are filtered by their attachment state on the
+/// VM (`vm` if given, else the last one used): `detach` lists only attached
+/// devices, `attach` lists everything and marks the attached ones, since
+/// re-attaching is how a stale libvirt registration gets refreshed. With no
+/// VM to consult, the unfiltered list is printed rather than nothing.
+fn complete_devices(
+    kind: DeviceKind,
+    purpose: Option<CompletePurpose>,
+    vm: Option<&str>,
+) -> Result<()> {
+    let vm = vm.map(str::to_string).or_else(load_last_vm);
+    let state = match (purpose, vm) {
+        (Some(_), Some(vm)) => Some(AttachedState::load(vm.trim())),
+        _ => None,
+    };
+
+    // (name, description, attached?) — `attached` is None when unknown.
+    let mut candidates: Vec<(String, String, Option<bool>)> = Vec::new();
     if kind == DeviceKind::All {
         for d in get_all_usb_devices().unwrap_or_default() {
-            lines.push(format!("{}:{}\t{}", d.vendor_id, d.product_id, d.name));
+            let attached = state
+                .as_ref()
+                .map(|s| s.has_usb(&d.vendor_id, &d.product_id));
+            candidates.push((
+                format!("{}:{}", d.vendor_id, d.product_id),
+                d.name,
+                attached,
+            ));
         }
     }
     if matches!(kind, DeviceKind::All | DeviceKind::Storage) {
         for d in load_virtual_drives().unwrap_or_default() {
-            lines.push(format!("{}\tvirtual storage ({})", d.name, d.size));
+            let attached = state.as_ref().map(|s| s.has_drive(&d));
+            candidates.push((
+                d.name.clone(),
+                format!("virtual storage ({})", d.size),
+                attached,
+            ));
         }
     }
     if matches!(kind, DeviceKind::All | DeviceKind::Hid) {
         for d in load_hid_devices().unwrap_or_default() {
-            lines.push(format!("{}\tvirtual HID ({}:{})", d.name, d.vid, d.pid));
+            let attached = state.as_ref().map(|s| s.has_hid(&d));
+            candidates.push((
+                d.name.clone(),
+                format!("virtual HID ({}:{})", d.vid, d.pid),
+                attached,
+            ));
         }
     }
+
+    let lines: Vec<String> = candidates
+        .into_iter()
+        .filter(|(_, _, attached)| {
+            purpose != Some(CompletePurpose::Detach) || *attached == Some(true)
+        })
+        .map(|(name, desc, attached)| {
+            if purpose == Some(CompletePurpose::Attach) && attached == Some(true) {
+                format!("{name}\t{desc} (attached)")
+            } else {
+                format!("{name}\t{desc}")
+            }
+        })
+        .collect();
+
     // The shell may stop reading early; a closed pipe is not worth an error.
     let _ = std::io::stdout().write_all(lines.join("\n").as_bytes());
     Ok(())
@@ -2626,7 +2747,9 @@ fn main() -> Result<()> {
     // Internal: shell completion support
     match &cli.command {
         Commands::Completions { shell } => return print_completions(*shell),
-        Commands::CompleteDevices { kind } => return complete_devices(*kind),
+        Commands::CompleteDevices { kind, purpose } => {
+            return complete_devices(*kind, *purpose, cli.vm.as_deref());
+        }
         _ => {}
     }
 
